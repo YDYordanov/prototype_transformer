@@ -1,0 +1,18 @@
+\begin{table}
+\caption{Slice-level robustness: Jensen--Shannon divergence (lower is better). Best per slice in bold.}
+\label{tab:robustness_slices}
+\begin{tabular}{lrrrr}
+\toprule
+model & Deltanet & LLaMA & Mamba & ProtoAttn \\
+slice &  &  &  &  \\
+\midrule
+abbreviation & 1.064231 & 0.332544 & \textbf{0.144146} & 0.416608 \\
+contraction & 0.830997 & 0.044879 & \textbf{0.010426} & 0.082258 \\
+morphology & 0.378451 & 0.054213 & \textbf{0.030811} & 0.054217 \\
+punctuation & 0.580196 & \textbf{0.173999} & 0.442759 & 0.398199 \\
+spelling & 0.354426 & 0.063446 & \textbf{0.005357} & 0.025950 \\
+synonym & 0.636455 & 0.144992 & \textbf{0.013020} & 0.113240 \\
+typo & 0.625949 & 0.226901 & \textbf{0.076057} & 0.207399 \\
+\bottomrule
+\end{tabular}
+\end{table}

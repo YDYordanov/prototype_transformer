@@ -1,0 +1,12 @@
+monitor_experiments.py
+__pycache__
+*.out
+*.log
+.data
+saved_model*
+data
+logs
+AGENTS.md
+settings.json
+*.sh
+*.err
