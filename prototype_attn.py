@@ -326,6 +326,9 @@ class ProtoBroadcastMixerUpgraded(nn.Module):
             dilation=1,
             bias=False,
         )  # local context path
+        # Intervention masks for rooting (optional; set via public methods below). Shape [num_heads, hubs_per_head], broadcast over batch/seq.
+        self.write_mask: Optional[torch.Tensor] = None
+        self.read_mask: Optional[torch.Tensor] = None
 
     # --- helpers ---
 
@@ -339,7 +342,8 @@ class ProtoBroadcastMixerUpgraded(nn.Module):
             return self.P_tables[h]                  # [r, C]
 
     def _route(self, q: torch.Tensor, protos: torch.Tensor, tau: torch.Tensor,
-               sparsity: str, k: Optional[int], return_scores: bool = False) -> torch.Tensor:
+               sparsity: str, k: Optional[int], return_scores: bool = False,
+               head_idx: Optional[int] = None, is_read: bool = False) -> torch.Tensor:
         """Compute routing Π from queries and prototypes.
         Args:
             q: [B, S, C] token queries (optionally pre-projected)
@@ -347,12 +351,23 @@ class ProtoBroadcastMixerUpgraded(nn.Module):
             tau: scalar temperature (per head)
             sparsity: 'none' | 'topk' | 'sparsemax'
             k: top-k value if sparsity='topk'
+            head_idx: head index for optional intervention masks
+            is_read: whether to apply the read mask rather than the write mask
         Returns:
             Π: [B, S, r] routing probabilities per token over hubs.
         """
         #protos = F.normalize(protos, p=2, dim=1, eps=1e-6)  # optional row-normalized prototypes for stability
         #q = F.normalize(q, p=2, dim=-1, eps=1e-6)          # norm queries too; perf is similar, but extra compute
         scores = torch.einsum("bsc,rc->bsr", q, protos) / (tau.abs() + 1e-6)
+        mask_to_use = self.read_mask if is_read else self.write_mask
+        if mask_to_use is not None and head_idx is not None:
+            head_mask = mask_to_use[head_idx].to(scores.device, dtype=scores.dtype)
+            score_mask = torch.where(
+                head_mask <= 0,
+                torch.full_like(head_mask, -float("inf")),
+                torch.zeros_like(head_mask),
+            )
+            scores = scores + score_mask.view(1, 1, -1)
         if sparsity == "topk" and k is not None:
             probs = topk_softmax(scores, k=k, dim=-1)
         elif sparsity == "sparsemax":
@@ -360,6 +375,40 @@ class ProtoBroadcastMixerUpgraded(nn.Module):
         else:
             probs = torch.softmax(scores, dim=-1)
         return (probs, scores) if return_scores else probs
+
+    def _normalize_mask(self, mask: Optional[torch.Tensor], name: str) -> Optional[torch.Tensor]:
+        if mask is None:
+            return None
+        if not torch.is_tensor(mask):
+            mask = torch.tensor(mask, dtype=self.alpha[0].dtype)
+        if mask.dim() == 1:
+            if self.cfg.num_heads != 1:
+                raise ValueError(f"1D {name} mask is only supported when num_heads == 1")
+            mask = mask.unsqueeze(0)
+        if mask.dim() != 2:
+            raise ValueError(f"{name} mask must have shape [num_heads, hubs_per_head]")
+        if mask.size(0) not in (1, self.cfg.num_heads):
+            raise ValueError(f"{name} mask head dimension mismatch")
+        if mask.size(1) != self.r_per_head:
+            raise ValueError(f"{name} mask prototype dimension mismatch")
+        mask = mask.to(device=self.alpha[0].device, dtype=self.alpha[0].dtype)
+        if mask.size(0) == 1 and self.cfg.num_heads > 1:
+            mask = mask.expand(self.cfg.num_heads, -1)
+        return mask
+
+    def set_write_mask(self, mask: Optional[torch.Tensor]) -> None:
+        """Set a per-head write mask where positive values keep a hub and non-positive values block it."""
+        self.write_mask = self._normalize_mask(mask, "write")
+
+    def clear_write_mask(self) -> None:
+        self.write_mask = None
+
+    def set_read_mask(self, mask: Optional[torch.Tensor]) -> None:
+        """Set a per-head read mask where positive values keep a hub and non-positive values block it."""
+        self.read_mask = self._normalize_mask(mask, "read")
+
+    def clear_read_mask(self) -> None:
+        self.read_mask = None
 
     def forward(self, x: torch.Tensor, return_aux: bool = False, pad_mask: Optional[torch.Tensor] = None, layer_id: Optional[int] = None):
         """Prefix-mean prototype mixing over a full sequence.
@@ -395,7 +444,7 @@ class ProtoBroadcastMixerUpgraded(nn.Module):
             tau = self.tau[h].abs() + 1e-6           # positive scalar
 
             # Routing: Π[b, s, k] over hubs k
-            route_out = self._route(q_in, protos, tau, cfg.sparsity, cfg.k, return_scores=return_aux)   # [B, S, r]
+            route_out = self._route(q_in, protos, tau, cfg.sparsity, cfg.k, return_scores=return_aux, head_idx=h)   # [B, S, r]
             if return_aux:
                 Pi, scores = route_out
             else:
@@ -524,7 +573,7 @@ class ProtoBroadcastMixerUpgraded(nn.Module):
                 if self.rope_q is not None:
                     q_r = self.rope_q.apply(q_r, pos)  # rotate after pre_r: same rotary space as scores
                 tau_r = self.tau_read[h].abs() + 1e-6
-                Pi_read = self._route(q_r, protos, tau_r, sparsity='none', k=cfg.k)  # [B,S,r]  # sparsity only on write Π
+                Pi_read = self._route(q_r, protos, tau_r, sparsity='none', k=cfg.k, head_idx=h, is_read=True)  # [B,S,r]  # sparsity only on write Π
                 Pi_read_eff = Pi_read if m is None else Pi_read * m
                 yv = torch.einsum("bsr,bsrc->bsc", Pi_read_eff, Pn)              # [B, S, C_v]
 
@@ -579,6 +628,7 @@ class ProtoBroadcastMixerUpgraded(nn.Module):
 
             if not cfg.shared_routing:
                 aux["Pi_read"] = Pi_read.detach()  # read routing matrix
+                aux["read_routing_Pi"] = Pi_read.detach()
 
             with torch.no_grad():
                 # Router confidence & sparsity
@@ -662,6 +712,18 @@ class MixerBlock(nn.Module):
         self.resid_drop1 = nn.Dropout(dropout)
         self.resid_drop2 = nn.Dropout(dropout)
 
+    def set_write_mask(self, mask: Optional[torch.Tensor]) -> None:
+        self.mixer.set_write_mask(mask)
+
+    def clear_write_mask(self) -> None:
+        self.mixer.clear_write_mask()
+
+    def set_read_mask(self, mask: Optional[torch.Tensor]) -> None:
+        self.mixer.set_read_mask(mask)
+
+    def clear_read_mask(self) -> None:
+        self.mixer.clear_read_mask()
+
     def forward(self, x, pad_mask=None, return_aux: bool = False):
         if return_aux:
             mixer_out, aux = self.mixer(self.norm1(x), pad_mask=pad_mask, return_aux=True, layer_id=self.layer_id)
@@ -707,6 +769,20 @@ class MixerStack(nn.Module):
         #self.blocks[2].mixer.tau[0].data.fill_(3.0)  # sharper initial routing at L2: helps with ppl (slightly)?
         # Shared routing on block >=3 harms ppl
         self.norm_out = nn.RMSNorm(dim)
+
+    def set_write_mask(self, layer_idx: int, mask: Optional[torch.Tensor]) -> None:
+        self.blocks[layer_idx].set_write_mask(mask)
+
+    def clear_all_write_masks(self) -> None:
+        for blk in self.blocks:
+            blk.clear_write_mask()
+
+    def set_read_mask(self, layer_idx: int, mask: Optional[torch.Tensor]) -> None:
+        self.blocks[layer_idx].set_read_mask(mask)
+
+    def clear_all_read_masks(self) -> None:
+        for blk in self.blocks:
+            blk.clear_read_mask()
 
     def forward(self, x, pad_mask=None, return_aux: bool = False):
         if return_aux:
@@ -800,6 +876,18 @@ class ProtoBroadcastLM(nn.Module):
 
         # init
         self.reset_parameters()
+
+    def set_write_mask(self, layer_idx: int, mask: Optional[torch.Tensor]) -> None:
+        self.backbone.set_write_mask(layer_idx, mask)
+
+    def clear_all_write_masks(self) -> None:
+        self.backbone.clear_all_write_masks()
+
+    def set_read_mask(self, layer_idx: int, mask: Optional[torch.Tensor]) -> None:
+        self.backbone.set_read_mask(layer_idx, mask)
+
+    def clear_all_read_masks(self) -> None:
+        self.backbone.clear_all_read_masks()
 
     def reset_parameters(self):
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
