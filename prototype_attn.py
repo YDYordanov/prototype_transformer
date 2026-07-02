@@ -410,7 +410,16 @@ class ProtoBroadcastMixerUpgraded(nn.Module):
     def clear_read_mask(self) -> None:
         self.read_mask = None
 
-    def forward(self, x: torch.Tensor, return_aux: bool = False, pad_mask: Optional[torch.Tensor] = None, layer_id: Optional[int] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_aux: bool = False,
+        pad_mask: Optional[torch.Tensor] = None,
+        layer_id: Optional[int] = None,
+        *,
+        force_write: Optional[torch.Tensor] = None,
+        force_read: Optional[torch.Tensor] = None,
+    ):
         """Prefix-mean prototype mixing over a full sequence.
         Args:
             x: [B, S, C] token features
@@ -455,6 +464,20 @@ class ProtoBroadcastMixerUpgraded(nn.Module):
                 hub_mask = torch.bernoulli(torch.full((B, S, r), 1.0 - cfg.hub_dropout, device=Pi.device)).to(Pi.dtype)
                 Pi = Pi * hub_mask
                 Pi = Pi / (Pi.sum(dim=-1, keepdim=True) + 1e-8)  # keep normalization differentiable
+
+            if force_write is not None:
+                fw = torch.as_tensor(force_write, device=Pi.device, dtype=Pi.dtype)
+                if fw.dim() == 1:
+                    fw = fw.view(1, 1, -1).expand(B, 1, -1)
+                elif fw.dim() == 2:
+                    fw = fw.unsqueeze(1)
+                if fw.shape != (B, 1, r):
+                    raise ValueError(
+                        f"force_write must have shape [{r}] or [{B}, {r}], "
+                        f"got {tuple(fw.shape)}"
+                    )
+                Pi = Pi.clone()
+                Pi[:, -1, :] = torch.softmax(fw[:, 0, :], dim=-1)
 
             # Mask pads so they do not contribute sums or mass
             Pi_eff = Pi if m is None else Pi * m                      # [B,S,r]
@@ -574,6 +597,19 @@ class ProtoBroadcastMixerUpgraded(nn.Module):
                     q_r = self.rope_q.apply(q_r, pos)  # rotate after pre_r: same rotary space as scores
                 tau_r = self.tau_read[h].abs() + 1e-6
                 Pi_read = self._route(q_r, protos, tau_r, sparsity='none', k=cfg.k, head_idx=h, is_read=True)  # [B,S,r]  # sparsity only on write Π
+                if force_read is not None:
+                    fr = torch.as_tensor(force_read, device=Pi_read.device, dtype=Pi_read.dtype)
+                    if fr.dim() == 1:
+                        fr = fr.view(1, 1, -1).expand(B, 1, -1)
+                    elif fr.dim() == 2:
+                        fr = fr.unsqueeze(1)
+                    if fr.shape != (B, 1, r):
+                        raise ValueError(
+                            f"force_read must have shape [{r}] or [{B}, {r}], "
+                            f"got {tuple(fr.shape)}"
+                        )
+                    Pi_read = Pi_read.clone()
+                    Pi_read[:, -1, :] = torch.softmax(fr[:, 0, :], dim=-1)
                 Pi_read_eff = Pi_read if m is None else Pi_read * m
                 yv = torch.einsum("bsr,bsrc->bsc", Pi_read_eff, Pn)              # [B, S, C_v]
 
@@ -724,14 +760,34 @@ class MixerBlock(nn.Module):
     def clear_read_mask(self) -> None:
         self.mixer.clear_read_mask()
 
-    def forward(self, x, pad_mask=None, return_aux: bool = False):
+    def forward(
+        self,
+        x,
+        pad_mask=None,
+        return_aux: bool = False,
+        *,
+        force_write: Optional[torch.Tensor] = None,
+        force_read: Optional[torch.Tensor] = None,
+    ):
         if return_aux:
-            mixer_out, aux = self.mixer(self.norm1(x), pad_mask=pad_mask, return_aux=True, layer_id=self.layer_id)
+            mixer_out, aux = self.mixer(
+                self.norm1(x),
+                pad_mask=pad_mask,
+                return_aux=True,
+                layer_id=self.layer_id,
+                force_write=force_write,
+                force_read=force_read,
+            )
             x = x + self.resid_drop1(mixer_out)
             x = x + self.resid_drop2(self.ffn(self.norm2(x)))
             return x, aux
         else:
-            x = x + self.resid_drop1(self.mixer(self.norm1(x), pad_mask=pad_mask))
+            x = x + self.resid_drop1(self.mixer(
+                self.norm1(x),
+                pad_mask=pad_mask,
+                force_write=force_write,
+                force_read=force_read,
+            ))
             x = x + self.resid_drop2(self.ffn(self.norm2(x)))
             return x
 
@@ -784,11 +840,25 @@ class MixerStack(nn.Module):
         for blk in self.blocks:
             blk.clear_read_mask()
 
-    def forward(self, x, pad_mask=None, return_aux: bool = False):
+    def forward(
+        self,
+        x,
+        pad_mask=None,
+        return_aux: bool = False,
+        *,
+        force_write: Optional[torch.Tensor] = None,
+        force_read: Optional[torch.Tensor] = None,
+    ):
         if return_aux:
             aux_collector = []
             for blk in self.blocks:
-                x, aux = blk(x, pad_mask=pad_mask, return_aux=True)
+                x, aux = blk(
+                    x,
+                    pad_mask=pad_mask,
+                    return_aux=True,
+                    force_write=force_write,
+                    force_read=force_read,
+                )
                 aux_collector.append(aux)
             x = self.norm_out(x)
             # Expose per-layer stats without "L{i}." prefixes; keep last-layer keys at top-level
@@ -821,7 +891,12 @@ class MixerStack(nn.Module):
             return x, merged_aux
         else:
             for blk in self.blocks:
-                x = blk(x, pad_mask=pad_mask)
+                x = blk(
+                    x,
+                    pad_mask=pad_mask,
+                    force_write=force_write,
+                    force_read=force_read,
+                )
             return self.norm_out(x)
 
 
@@ -895,7 +970,16 @@ class ProtoBroadcastLM(nn.Module):
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
 
     # ---- full-sequence forward ----
-    def forward(self, input_ids: torch.LongTensor, pad_mask=None, return_logits: bool = True, return_aux: bool = False):
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        pad_mask=None,
+        return_logits: bool = True,
+        return_aux: bool = False,
+        *,
+        force_write: Optional[torch.Tensor] = None,
+        force_read: Optional[torch.Tensor] = None,
+    ):
         """
         input_ids: [B, S]
         pad_mask: [B, S] (optional)
@@ -907,7 +991,13 @@ class ProtoBroadcastLM(nn.Module):
     
         if return_aux:
             # Forward through backbone with aux collection
-            x, aux_outputs = self.backbone(x, pad_mask=pad_mask, return_aux=True)
+            x, aux_outputs = self.backbone(
+                x,
+                pad_mask=pad_mask,
+                return_aux=True,
+                force_write=force_write,
+                force_read=force_read,
+            )
             logits = self.lm_head(x)                                    # [B, S, V]
             if return_logits:
                 return logits, aux_outputs
@@ -915,6 +1005,61 @@ class ProtoBroadcastLM(nn.Module):
                 return x, aux_outputs
         else:
             # Normal forward
-            x = self.backbone(x, pad_mask=pad_mask)                     # [B, S, C]
+            x = self.backbone(
+                x,
+                pad_mask=pad_mask,
+                force_write=force_write,
+                force_read=force_read,
+            )                                                           # [B, S, C]
             logits = self.lm_head(x)                                    # [B, S, V]
             return logits if return_logits else x
+
+    @torch.no_grad()
+    def get_last_routing(self, text, tokenizer=None, device=None):
+        """Return the final layer's write/read routing vectors at the last token."""
+        if not callable(tokenizer):
+            raise TypeError("tokenizer must be a callable that maps text to token IDs")
+        dev = device or next(self.parameters()).device
+        ids = torch.tensor([tokenizer(text)], device=dev)
+
+        _, aux = self.forward(ids, return_aux=True)
+        per_layer = aux.get("per_layer", [])
+        if not per_layer:
+            raise RuntimeError("routing diagnostics were not returned by the backbone")
+        last = per_layer[-1]
+
+        pi_write = last.get("routing_Pi")
+        if pi_write is None:
+            raise RuntimeError("write routing diagnostics are unavailable")
+        write_vec = pi_write[0, -1, 0, :].detach().cpu()
+
+        pi_read = last.get("Pi_read")
+        if pi_read is None:
+            read_vec = write_vec
+        else:
+            read_vec = pi_read[0, -1, :].detach().cpu()
+
+        return {"write_weights": write_vec, "read_weights": read_vec}
+
+    @torch.no_grad()
+    def next_token_probs_forced(
+        self,
+        text,
+        tokenizer=None,
+        device=None,
+        force_write=None,
+        force_read=None,
+    ):
+        """Return next-token probabilities with last-token routing clamped."""
+        if not callable(tokenizer):
+            raise TypeError("tokenizer must be a callable that maps text to token IDs")
+        dev = device or next(self.parameters()).device
+        ids = torch.tensor([tokenizer(text)], device=dev)
+
+        if force_write is not None:
+            force_write = torch.as_tensor(force_write, device=dev, dtype=torch.float32)
+        if force_read is not None:
+            force_read = torch.as_tensor(force_read, device=dev, dtype=torch.float32)
+
+        logits = self.forward(ids, force_write=force_write, force_read=force_read)
+        return F.softmax(logits[0, -1], dim=-1)
