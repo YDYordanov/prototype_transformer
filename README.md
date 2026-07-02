@@ -102,7 +102,7 @@ python test_eval_experiments.py --experiment_dir=logs/scalability_models_ctx
 
 ### Further Experiments
 
-The downstream performance, text-generation, interpretability, intervention, and robustness experiments will be found in the subfolders of the `experiments/` folder, where each will have self-contained code and instructions.
+The downstream performance, text-generation, interpretability, intervention, and robustness experiments are in the subfolders of the `experiments/` folder, where each has self-contained code and instructions.
 
 Note: some experiment scripts import top-level modules (e.g. from `prototype_attention`), so for those make sure to run them from the top-level directory e.g. as follows:
 
